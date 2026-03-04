@@ -1,9 +1,14 @@
 import dotenv
 
 dotenv.load_dotenv()
+from openai import OpenAI
 import asyncio
 import streamlit as st
-from agents import Agent, Runner, SQLiteSession, WebSearchTool
+from agents import Agent, Runner, SQLiteSession, WebSearchTool, FileSearchTool
+
+client = OpenAI()
+
+VECTOR_STORE_ID = "vs_69a7a8afe2a48191ab5b382ac50fe789"
 
 if "agent" not in st.session_state:
     st.session_state["agent"] = Agent(
@@ -14,10 +19,22 @@ if "agent" not in st.session_state:
         You have access to the followign tools:
             - Web Search Tool: Use this when the user asks a questions that isn't in your training data. 
               Use this tool when the users asks about life coaching topics, when you think you don't know the answer, 
+              try searching for it in the web first. If answer is not in your training data nor in the files,  
               try searching for it in the web first.
+            - File Search Tool: Use this tool when the user asks a question about life coaching related to themselves. Or when they ask questions about specific files.
+
+        Strategy:
+        - Use BOTH tools together when appropriate to provide comprehensive answers
+        - Use Web Search Tool for current trends, new information, and general life coaching advice
+        - Use File Search Tool for personal context and uploaded documents
+        - Combine results from both tools to give the best answer
         """,
         tools=[
             WebSearchTool(),
+            FileSearchTool(
+                vector_store_ids=[VECTOR_STORE_ID],
+                max_num_results=3,
+            ),
         ]
     )
 agent = st.session_state["agent"]
@@ -35,6 +52,9 @@ def update_status(status_container, event):
         "response.web_search_call.completed": ("✅ Web search completed.", "complete"),
         "response.web_search_call.in_progress": ("🔍 Starting web search...", "running"),
         "response.web_search_call.searching": ("🔍 Web search in progress...", "running"),
+        "response.file_search_call.completed": ("✅ File search completed.", "complete"),
+        "response.file_search_call.in_progress": ("📂 Starting file search...", "running"),
+        "response.file_search_call.searching": ("📂 File search in progress...", "running"),
         "response.completed": (" ", "complete"),
     }
 
@@ -53,11 +73,15 @@ async def paint_history():
                     st.write(message["content"])
                 else:
                     if message["type"] == "message":
-                        st.write(message["content"][0]["text"])
-        if "type" in message and message["type"] == "web_search_call":  
-            with st.chat_message("ai"):
-                st.write("🔍 Web searching ..")
-                         
+                        st.write(message["content"][0]["text"].replace("$", "\$"))
+
+        if "type" in message:
+            if message["type"] == "web_search_call":  
+                with st.chat_message("ai"):
+                    st.write("🔍 Web searching ..")
+            elif message["type"] == "file_search_call":  
+                with st.chat_message("ai"):
+                    st.write("📂 File searching ..")                         
 
 
 
@@ -81,16 +105,35 @@ async def run_agent(message):
 
                 if event.data.type == "response.output_text.delta":
                     response += event.data.delta
-                    text_placeholder.write(response)
+                    text_placeholder.write(response.replace("$", "\$") )
+
 
 
     
-prompt = st.chat_input("Write a message for your assistant:")
+prompt = st.chat_input("Write a message for your assistant:"
+                       ,accept_file=True
+                       ,file_type=["pdf","txt"])
 
 if prompt:
-    with st.chat_message("user"):
-        st.write(prompt)
-    asyncio.run(run_agent(prompt))
+    for file in prompt.files:
+        if file.type.startswith("text/") or file.type == "application/pdf":
+            with st.chat_message("ai"):
+                with st.status(" Uploading file...") as status:
+                    uploaded_file = client.files.create(
+                        file=(file.name, file.getvalue()),
+                        purpose="user_data",
+                    )
+                    status.update(label="⏳ Attaching file ... ")
+                    client.vector_stores.files.create(
+                        vector_store_id=VECTOR_STORE_ID,
+                        file_id=uploaded_file.id,
+                    )
+                    status.update(label="✅ File uploaded", state="complete")
+
+    if prompt.text:
+        with st.chat_message("user"):
+            st.write(prompt.text)
+        asyncio.run(run_agent(prompt.text))
 
 with st.sidebar:
     reset = st.button("Reset memory")
